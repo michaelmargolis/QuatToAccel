@@ -9,7 +9,6 @@ tested with anaconda and these packages :
    pip install scikit-kinematics
 """
 
-## To do: filter qinverse in vel and acc calculations
 
 
 import sys
@@ -27,6 +26,7 @@ class Telemetry():
 
     def __init__(self):
         self.q_array = np.zeros((5,4)) #array storing most recent five quaternions
+        self.time = np.zeros(1) #array storing the timestamps of each quaternion
         self.data_count = 0  # how many telemetry msgs received
         self.position = np.zeros((1,4)) #array to store all position quaternions, slow as we append at each stage.
         self.velocity = np.zeros((6,4)) #array to store all velocity quaternions, slow as we append at each stage. Can't calculate the first 5
@@ -53,11 +53,11 @@ class Telemetry():
                       dur = floats[0] - prev_time
                       prev_time = floats[0]
                       #print(dur, floats[1:5])
-                      self.process_telemetry(dur, floats[1:5])
-        print("Pos shape",self.position.shape)
-        print("Vel shape",self.velocity.shape)
+                      self.process_telemetry(dur, floats[1:5], floats[0])
+        #print("Pos shape",self.position.shape)
+        #print("Vel shape",self.velocity.shape)
     
-    def process_telemetry(self, dur, quat):
+    def process_telemetry(self, dur, quat, time):
         # dur is time in seconds since previous quaternion
         # quat is list of the four quaternion elements
         # print(dur, quat)
@@ -66,20 +66,21 @@ class Telemetry():
         #  print(self.q_array[-1])
         self.q_array[:-1] = self.q_array[1:]
         self.q_array[-1] = np.array([quat[0], quat[1], quat[2], quat[3]])
-        # Keep all telemetry for visualisation purposes
+        ## Keep all telemetry for visualisation purposes
+        self.time = np.append(self.time, time)
         self.position = np.append(self.position, [self.q_array[-1]], axis=0)
         #  print(self.q_array )
         if self.data_count < 6:  # need at least 5 rows to calculate velocity
             return None
-        a = self.calc_angvel(self.q_array, dur, 0)
-        print("output from calc_angvel=\n",  a)
+        a = self.calc_angvel(self.q_array, dur)
+        #print("output from calc_angvel=\n",  a)
         self.velocity = np.append(self.velocity, [a[-1]], axis=0)
-        b = self.calc_angacc(self.q_array, dur, 0)
+        b = self.calc_angacc(self.q_array, dur)
         self.acceleration = np.append(self.acceleration, [b[-1]], axis=0)
         # TODO .....
         
 
-    def calc_angvel(self, q, interval, rotationAxis, winSize=5, order=2):
+    def calc_angvel(self, q, interval, winSize=5, order=2):
         '''
         Take a quaternion, and convert it into the
         corresponding angular velocity
@@ -132,11 +133,14 @@ class Telemetry():
         ## Ok, the filter (or "smoother" to be more precise) should use future data to determine current data (with a window of 5 we need
         ## 2 future quaternions). Instead, we are using the previous 5, which might not give the best approximation.
         ## A better mathematical understanding would be needed.
-        dq_dt = scipy.signal.savgol_filter(q, window_length=winSize, polyorder=order, deriv=1, delta=interval, axis=rotationAxis)
-        angVel = 2 * skin.quat.q_mult(dq_dt, skin.quat.q_inv(q))
+        dq_dt = scipy.signal.savgol_filter(q, window_length=winSize, polyorder=order, deriv=1, delta=interval, axis=0)
+        ## Also filter q_inv
+        q_inv_filter = scipy.signal.savgol_filter(skin.quat.q_inv(q), window_length=winSize, polyorder=order, deriv=0, delta=interval, axis=0)
+        
+        angVel = 2 * skin.quat.q_mult(dq_dt, q_inv_filter)
         return angVel
 
-    def calc_angacc(self, q, interval, rotationAxis, winSize=5, order=2):
+    def calc_angacc(self, q, interval, winSize=5, order=3):
         '''
         Calculate the acceleration from a sequence of orientations, all described as quaternions.
 
@@ -188,14 +192,56 @@ class Telemetry():
         ## Ok, the filter (or "smoother" to be more precise) should use future data to determine current data (with a window of 5 we need
         ## 2 future quaternions). Instead, we are using the previous 5, which might not give the best approximation.
         ## A better mathematical understanding would be needed.
-        dq_dt = scipy.signal.savgol_filter(q, window_length=winSize, polyorder=order, deriv=1, delta=interval, axis=rotationAxis)
-        d2q_dt2 = scipy.signal.savgol_filter(q, window_length=winSize, polyorder=order, deriv=2, delta=interval, axis=rotationAxis)
-        temp = skin.quat.q_mult(dq_dt, skin.quat.q_inv(q))
-        angAcc = 2 * (skin.quat.q_mult(d2q_dt2, skin.quat.q_inv(q)) - skin.quat.q_mult(temp,temp))
+        dq_dt = scipy.signal.savgol_filter(q, window_length=winSize, polyorder=order, deriv=1, delta=interval, axis=0)
+        d2q_dt2 = scipy.signal.savgol_filter(q, window_length=winSize, polyorder=order, deriv=2, delta=interval, axis=0)
+        ## Also filter q_inv
+        q_inv_filter = scipy.signal.savgol_filter(skin.quat.q_inv(q), window_length=winSize, polyorder=order, deriv=0, delta=interval, axis=0)
+        
+        temp = skin.quat.q_mult(dq_dt, q_inv_filter)
+        angAcc = 2 * (skin.quat.q_mult(d2q_dt2, q_inv_filter) - skin.quat.q_mult(temp,temp))
         return angAcc
 
-start_time = 30  #process telemetry data that is greater than or equal to this time in seconds
-secs_to_read = 20  # number of seconds of telemetry data to process
+    def visualise(self):
+        
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+
+        def export(time,data,filename,title):
+
+            fig, ax = plt.subplots()
+            xdata, ydata = [], []
+            ln, = plt.plot([], [], 'b-', animated=True)
+
+            def init():
+                ax.set_xlim(start_time, start_time + secs_to_read)
+                ax.set_ylim(0, 100)
+                plt.title(title)
+                return ln,
+
+            def update(frame):
+                xdata.append(time[frame])
+                ydata.append(data[frame])
+                ln.set_data(xdata, ydata)
+                return ln,
+
+            anim = animation.FuncAnimation(fig, update, frames=len(time), interval=20,
+                    init_func=init, blit=True)
+            ## 20ms between frames gives 50 fps
+            FFwriter=animation.FFMpegWriter(fps=50, extra_args=['-vcodec', 'libx264'])
+            anim.save(filename, writer=FFwriter)
+
+            plt.show()
+
+        
+        time = self.time
+        vel = np.linalg.norm(self.velocity,axis=1)
+        acc = np.linalg.norm(self.acceleration,axis=1)
+
+        export(time,vel,"Velocity Magnitude.mp4", "Velocity magnitude")
+        export(time,acc,"Acceleration Magnitude.mp4", "Acceleration magnitude")
+
+start_time = 0  #process telemetry data that is greater than or equal to this time in seconds
+secs_to_read = 90  # number of seconds of telemetry data to process
 
 if __name__ == "__main__":
     telemetry = Telemetry()
@@ -203,3 +249,4 @@ if __name__ == "__main__":
     skin.view.orientation(telemetry.position,title_text="Orientation",out_file = "orientation.mp4", deltaT=20)
     skin.view.orientation(telemetry.velocity,title_text="Velocity",out_file = "velocity.mp4", deltaT=20)
     skin.view.orientation(telemetry.acceleration,title_text="Acceleration",out_file = "acceleration.mp4", deltaT=20)
+    telemetry.visualise()
