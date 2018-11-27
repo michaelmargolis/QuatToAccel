@@ -25,15 +25,21 @@ import traceback
 class Telemetry():
 
     def __init__(self):
-        self.q_array = np.zeros((5,4)) #array storing most recent five quaternions
+        self.q_array = np.zeros((5,4)) #array storing five most recent orientation quaternions
         self.time = np.zeros(1) #array storing the timestamps of each quaternion
         self.data_count = 0  # how many telemetry msgs received
-        self.position = np.zeros((1,4)) #array to store all position quaternions, slow as we append at each stage.
-        self.velocity = np.zeros((6,4)) #array to store all velocity quaternions, slow as we append at each stage. Can't calculate the first 5
-        self.acceleration = np.zeros((6,4)) #array to store all acceleration quaternions, slow as we append at each stage. Can't calculate the first 5
+        self.deltaq = np.zeros((5,4)) # array storing five most recent divided difference orientations as quaternions
+        self.deltaq[0] = [1,0,0,0] # initial quat difference is the identity quaternion
+        self.rotrate = np.zeros((5,3)) # array storing five most recent yaw/pitch/roll rates, in degrees per second
+        self.rotacc = np.zeros((5,3)) # array storing five most recent roll/pitch/yaw accelerations, in degrees per second^2
+        # for storing all the data, rather than the most recent 5:
+        self.allorientation = np.zeros((1,4))
+        self.allrotrate = np.zeros((1,3))
+        self.allrotacc = np.zeros((1,3))
 
     def read(self, fname, start_time, seconds_to_read):
-        # data format is:  time,q0,q1,q2,q3\n
+        # data format is:  time,q1,q2,q3,q0\n
+		
         prev_time = 0  # this will be set to time of row being processed, used to calc duration
         with open(fname, 'r') as f:
             data = f.read().split('\n')
@@ -52,8 +58,11 @@ class Telemetry():
                     else:
                       dur = floats[0] - prev_time
                       prev_time = floats[0]
-                      #print(dur, floats[1:5])
-                      self.process_telemetry(dur, floats[1:5], floats[0])
+                
+		      ## Nolimits Telemetry exports quaternions in order xyzw. Standard order is wxyz
+                      quat = np.array([floats[4], floats[1], floats[2], floats[3]])
+		      #print(dur, quat)
+                      self.process_telemetry(dur, quat, floats[0])
         #print("Pos shape",self.position.shape)
         #print("Vel shape",self.velocity.shape)
     
@@ -66,156 +75,105 @@ class Telemetry():
         #  print(self.q_array[-1])
         self.q_array[:-1] = self.q_array[1:]
         self.q_array[-1] = np.array([quat[0], quat[1], quat[2], quat[3]])
-        ## Keep all telemetry for visualisation purposes
+
+        ## Keep all orientations for visualisation purposes
         self.time = np.append(self.time, time)
-        self.position = np.append(self.position, [self.q_array[-1]], axis=0)
+        self.allorientation = np.append(self.allorientation, [self.q_array[-1]], axis=0)
         #  print(self.q_array )
-        if self.data_count < 6:  # need at least 5 rows to calculate velocity
+
+
+        if self.data_count < 2:  # need at least 2 rows to calculate velocity
             return None
-        a = self.calc_angvel(self.q_array, dur)
-        #print("output from calc_angvel=\n",  a)
-        self.velocity = np.append(self.velocity, [a[-1]], axis=0)
-        b = self.calc_angacc(self.q_array, dur)
-        self.acceleration = np.append(self.acceleration, [b[-1]], axis=0)
-        # TODO .....
+		
+	## Angular velocity as divided difference of quaternions
+        self.deltaq[:-1] = self.deltaq[1:]
+        self.deltaq[-1] = skin.quat.q_mult(skin.quat.q_inv(self.q_array[-1]),self.q_array[-2] )
+		
+	## Angular velocity in yaw/pitch/roll
+        self.rotrate[:-1] = self.rotrate[1:] 
+        self.rotrate[-1] = skin.quat.quat2seq(self.deltaq[-1],"Fick") / dur
+
+        ## Keep all rotations and accelerations, for visualisation purposes
+        self.allrotrate = np.append(self.allrotrate, [self.rotrate[-1]], axis = 0)
+
+        if self.data_count < 3:  # need at least 3 rows to calculate acceleration
+            return None
+	
+        ## Angular acceleration in yaw/pitch/roll
+        self.rotacc[:-1] = self.rotacc[1:]
+        self.rotacc[-1] = (self.rotrate[-1] - self.rotrate[-2]) / dur
+		
+	### These are divided differences, so are not smoothed. We could smooth each component of self.rotrate and self.rotacc separately, but a better approach would be to smooth the quaternions first, and compute the derivate of the smoothed object analytically. This can be done with the calc_angvel function from the scikit-kinematics package, but we then need to interpret the result, which is an element of the lie algebras so(3), correctly.
         
-
-    def calc_angvel(self, q, interval, winSize=5, order=2):
-        '''
-        Take a quaternion, and convert it into the
-        corresponding angular velocity
-
-        Parameters
-        ----------
-        q : array, shape (N,[3,4])
-            unit quaternion vectors.
-            N is at least winSize
-        rate : float
-            sampling rate (in [Hz])
-        winSize : integer
-            window size for the calculation of the velocity.
-            Has to be odd.
-        order : integer
-            Order of polynomial used by savgol to calculate the first derivative
-
-        Returns
-        -------
-        angvel : array, shape (3,) or (N,3)
-            angular velocity [rad/s].
-
-        Notes
-        -----
-        The angular velocity is given by
-
-          .. math::
-            \\omega = 2 * \\frac{dq}{dt} \\circ q^{-1}
-
-        Examples
-        --------
-        >>> rate = 1000
-        >>> t = np.arange(0,10,1/rate)
-        >>> x = 0.1 * np.sin(t)
-        >>> y = 0.2 * np.sin(t)
-        >>> z = np.zeros_like(t)
-        array([[ 0.20000029,  0.40000057,  0.        ],
-               [ 0.19999989,  0.39999978,  0.        ],
-               [ 0.19999951,  0.39999901,  0.        ]])
-                .......
-        '''
-        
-        if np.mod(winSize, 2) != 1:
-            raise ValueError('Window size must be odd!')
-        
-        numCols = 4 ##### fixme   q.shape[1]
-        if numCols != 4:
-            raise TypeError('quaternions must have 4 columns')
-        # print("rotation axis=", rotationAxis)
-        ## Ok, the filter (or "smoother" to be more precise) should use future data to determine current data (with a window of 5 we need
-        ## 2 future quaternions). Instead, we are using the previous 5, which might not give the best approximation.
-        ## A better mathematical understanding would be needed.
-        dq_dt = scipy.signal.savgol_filter(q, window_length=winSize, polyorder=order, deriv=1, delta=interval, axis=0)
-        ## Also filter q_inv
-        q_inv_filter = scipy.signal.savgol_filter(skin.quat.q_inv(q), window_length=winSize, polyorder=order, deriv=0, delta=interval, axis=0)
-        
-        angVel = 2 * skin.quat.q_mult(dq_dt, q_inv_filter)
-        return angVel
-
-    def calc_angacc(self, q, interval, winSize=5, order=3):
-        '''
-        Calculate the acceleration from a sequence of orientations, all described as quaternions.
-
-        Parameters
-        ----------
-        q : array, shape (N,[3,4])
-            unit quaternion vectors.
-            N is at least winSize
-        rate : float
-            sampling rate (in [Hz])
-        winSize : integer
-            window size for the calculation of the velocity.
-            Has to be odd.
-        order : integer
-            Order of polynomial used by savgol to calculate the first derivative
-
-        Returns
-        -------
-        angacc : array, shape (3,) or (N,3)
-            angular acceleration (N,3)
-
-        Notes
-        -----
-        The angular acceleration is given by
-
-          .. math::
-            \\omega = 2 * \\frac{d^2q}{dt^2} \\circ q^{-1} - (\\frac{dq}{dt} \\circ q^{-1})^2
-
-        Examples
-        --------
-        >>> rate = 1000
-        >>> t = np.arange(0,10,1/rate)
-        >>> x = 0.1 * np.sin(t)
-        >>> y = 0.2 * np.sin(t)
-        >>> z = np.zeros_like(t)
-        array([[ 0.20000029,  0.40000057,  0.        ],
-               [ 0.19999989,  0.39999978,  0.        ],
-               [ 0.19999951,  0.39999901,  0.        ]])
-                .......
-        '''
-        
-        if np.mod(winSize, 2) != 1:
-            raise ValueError('Window size must be odd!')
-        
-        numCols = 4 ##### fixme   q.shape[1]
-        if numCols != 4:
-            raise TypeError('quaternions must have 4 columns')
-        # print("rotation axis=", rotationAxis)
-        ## Ok, the filter (or "smoother" to be more precise) should use future data to determine current data (with a window of 5 we need
-        ## 2 future quaternions). Instead, we are using the previous 5, which might not give the best approximation.
-        ## A better mathematical understanding would be needed.
-        dq_dt = scipy.signal.savgol_filter(q, window_length=winSize, polyorder=order, deriv=1, delta=interval, axis=0)
-        d2q_dt2 = scipy.signal.savgol_filter(q, window_length=winSize, polyorder=order, deriv=2, delta=interval, axis=0)
-        ## Also filter q_inv
-        q_inv_filter = scipy.signal.savgol_filter(skin.quat.q_inv(q), window_length=winSize, polyorder=order, deriv=0, delta=interval, axis=0)
-        
-        temp = skin.quat.q_mult(dq_dt, q_inv_filter)
-        angAcc = 2 * (skin.quat.q_mult(d2q_dt2, q_inv_filter) - skin.quat.q_mult(temp,temp))
-        return angAcc
+        ## Keep all rotations and accelerations, for visualisation purposes
+        self.allrotacc = np.append(self.allrotacc, [self.rotacc[-1]], axis = 0)
 
     def visualise(self):
+
+        # Coastervideo is 30 fps
+        fps = 30
+        # we want one frame every
+        delay = 1/30  # seconds
+
+        # Need to drop some frames
+        endtime = self.time[-1] #
+        self.animtime = np.arange(0,endtime, delay) #times for animation
+        frames = len(self.animtime)
+        print("Number of frames to produce",frames)
+        self.animorientation = np.zeros((frames,4)) #prepare orientations for animation
+        #self.animvelocity = np.zeros((frames,4)) #prepare velocity for animation
+        self.animrotrate = np.zeros((frames,3))
+        self.animrotacc = np.zeros((frames,3))
+        #self.animrelvelocity = np.zeros((frames,4)) #prepare velocity for animation
+        #self.animacceleration = np.zeros((frames,4)) #prepare acceleration for animation
+
+        for j in range(0,len(self.animtime)):
+            time = self.animtime[j]
+            #print("Searching for time",time)
+            idx = np.searchsorted(self.time, time)
+            self.animorientation[j] = self.allorientation[idx]
+            self.animrotrate[j] = self.allrotrate[idx]
+            self.animrotacc[j] = self.allrotacc[idx]
+            
+        ## Need correct orientations to NoLimits2 world coordinates.
+        rot1 = np.array( [np.cos(np.pi/4), -np.sin(np.pi/4),0,0])
+        rot2 = np.array( [np.cos(np.pi/4), 0,0,np.sin(np.pi/4)])
+
+        std2world = skin.quat.q_mult(skin.quat.q_inv(rot2),skin.quat.q_inv(rot1))
+        # Quaternions are in terms of the world coordinates.
+        world2std = skin.quat.q_mult(rot1,rot2)
+        # or to orientate so that positive y is the identity
+        #world2std = rot1
+        
+        temp = skin.quat.q_mult(std2world,self.animorientation)
+        self.animorientation = skin.quat.q_mult(temp, world2std)
+
+        print("Data prepared. Rendering...")
+
+        ## For visualising orientations in 3d
+        skin.view.orientation(self.animorientation,title_text="Orientation",out_file = "orientation.mp4", deltaT=20)
         
         import matplotlib.pyplot as plt
+        import mpl_toolkits.mplot3d.axes3d as p3
         import matplotlib.animation as animation
 
-        def export(time,data,filename,title):
+        ## Function for exporting linegraphs for velocity and acceleration magnitudes.
+        def export(time,data,filename,title,ylabel):
 
             fig, ax = plt.subplots()
             xdata, ydata = [], []
             ln, = plt.plot([], [], 'b-', animated=True)
+           # plt.yscale('log')
+            plt.title(title)
+            plt.ylabel(ylabel)
+            ax.set_ylim(min(data) , max(data))
 
             def init():
                 ax.set_xlim(start_time, start_time + secs_to_read)
-                ax.set_ylim(0, 100)
-                plt.title(title)
+                #ax.set_ylim(0, 100)
+                #ax.set_yscale("log",nonposy='clip')
+                #plt.yscale('log')
+                #plt.title(title)
                 return ln,
 
             def update(frame):
@@ -224,21 +182,32 @@ class Telemetry():
                 ln.set_data(xdata, ydata)
                 return ln,
 
-            anim = animation.FuncAnimation(fig, update, frames=len(time), interval=20,
+            anim = animation.FuncAnimation(fig, update, frames=len(time), interval=delay*1000,
                     init_func=init, blit=True)
-            ## 20ms between frames gives 50 fps
-            FFwriter=animation.FFMpegWriter(fps=50, extra_args=['-vcodec', 'libx264'])
+            
+            FFwriter=animation.FFMpegWriter(fps=fps, extra_args=['-vcodec', 'libx264'])
             anim.save(filename, writer=FFwriter)
 
             plt.show()
 
         
-        time = self.time
-        vel = np.linalg.norm(self.velocity,axis=1)
-        acc = np.linalg.norm(self.acceleration,axis=1)
+        yawrate = self.animrotrate[:,0]
+        pitchrate = self.animrotrate[:,1]
+        rollrate = self.animrotrate[:,2]
 
-        export(time,vel,"Velocity Magnitude.mp4", "Velocity magnitude")
-        export(time,acc,"Acceleration Magnitude.mp4", "Acceleration magnitude")
+        yawacc = self.animrotacc[:,0]
+        pitchacc = self.animrotacc[:,1]
+        rollacc = self.animrotacc[:,2]
+           
+            
+        export(self.animtime,rollrate,"RollRate.mp4", "Roll Rate","Degrees / second")
+        export(self.animtime,pitchrate,"PitchRate.mp4", "Pitch Rate","Degrees / second")
+        export(self.animtime,yawrate,"YawRate.mp4", "Yaw Rate","Degrees / second")
+
+        export(self.animtime,rollacc,"RollAcc.mp4", "Roll Acceleration","Degrees / second^2")
+        export(self.animtime,pitchacc,"PitchAcc.mp4", "Pitch Acceleration","Degrees / second^2")
+        export(self.animtime,yawacc,"YawAcc.mp4", "Yaw Acceleration","Degrees / second^2") 
+
 
 start_time = 0  #process telemetry data that is greater than or equal to this time in seconds
 secs_to_read = 90  # number of seconds of telemetry data to process
@@ -246,7 +215,7 @@ secs_to_read = 90  # number of seconds of telemetry data to process
 if __name__ == "__main__":
     telemetry = Telemetry()
     telemetry.read('telemetry.csv', start_time, secs_to_read )
-    skin.view.orientation(telemetry.position,title_text="Orientation",out_file = "orientation.mp4", deltaT=20)
-    skin.view.orientation(telemetry.velocity,title_text="Velocity",out_file = "velocity.mp4", deltaT=20)
-    skin.view.orientation(telemetry.acceleration,title_text="Acceleration",out_file = "acceleration.mp4", deltaT=20)
-    telemetry.visualise()
+    
+    #skin.view.orientation(telemetry.velocity,title_text="Velocity",out_file = "velocity.mp4", deltaT=20)
+    #skin.view.orientation(telemetry.acceleration,title_text="Acceleration",out_file = "acceleration.mp4", deltaT=20)
+    #telemetry.visualise()
